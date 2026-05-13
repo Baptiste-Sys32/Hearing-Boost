@@ -1,4 +1,5 @@
 import ctypes
+import argparse
 import html
 import json
 import math
@@ -7,38 +8,46 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 try:
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QIcon
+    from PySide6.QtGui import QAction, QIcon
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
         QFrame,
         QHBoxLayout,
         QLabel,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPushButton,
         QSlider,
+        QSystemTrayIcon,
         QVBoxLayout,
         QWidget,
     )
 except Exception as exc:  # pragma: no cover - shown at runtime
     Qt = None
     QTimer = None
+    QAction = None
     QIcon = None
     QApplication = None
     QCheckBox = None
+    QComboBox = None
     QFrame = None
     QHBoxLayout = None
     QLabel = None
     QMainWindow = None
+    QMenu = None
     QMessageBox = None
     QPushButton = None
     QSlider = None
+    QSystemTrayIcon = None
     QVBoxLayout = None
     QWidget = None
     QT_IMPORT_ERROR = exc
@@ -96,6 +105,13 @@ class ApoState:
 class ApoSnapshot:
     path: Path
     original_text: str
+
+
+@dataclass(frozen=True)
+class AudioDevice:
+    id: str
+    name: str
+    is_default: bool = False
 
 
 def is_admin() -> bool:
@@ -189,19 +205,51 @@ def download_apo_installer(destination: Path) -> None:
 class WindowsAudio:
     backend_name = "Windows"
 
-    def __init__(self) -> None:
+    def __init__(self, device_id: str | None = None) -> None:
         if not IS_WINDOWS:
             raise RuntimeError("Windows audio controls are only available on Windows.")
         if IMPORT_ERROR:
             raise RuntimeError(f"Missing audio dependency: {IMPORT_ERROR}")
         comtypes.CoInitialize()
-        self.device = AudioUtilities.GetSpeakers()
+        self.device = self._select_device(device_id)
         self.volume = getattr(self.device, "EndpointVolume", None)
         if self.volume is None:
             endpoint = self.device._dev.Activate(IAudioEndpointVolume._iid_, 23, None)
             self.volume = endpoint.QueryInterface(IAudioEndpointVolume)
+        self._channel_count = int(self.volume.GetChannelCount())
         self._last_channels: tuple[float, ...] | None = None
         self.original_channels = self.read_channel_scalars()
+
+    @staticmethod
+    def list_devices() -> list[AudioDevice]:
+        if not IS_WINDOWS or IMPORT_ERROR:
+            return []
+
+        default = AudioUtilities.GetSpeakers()
+        default_id = str(getattr(default, "id", getattr(default, "FriendlyName", "default")))
+        devices: list[AudioDevice] = []
+        for device in AudioUtilities.GetAllDevices():
+            name = str(getattr(device, "FriendlyName", "Playback device"))
+            device_id = str(getattr(device, "id", name))
+            state = str(getattr(device, "State", ""))
+            if state and state not in {"1", "DEVICE_STATE_ACTIVE"}:
+                continue
+            devices.append(AudioDevice(id=device_id, name=name, is_default=device_id == default_id))
+
+        if not devices:
+            devices.append(AudioDevice(id=default_id, name=getattr(default, "FriendlyName", "Default playback device"), is_default=True))
+        return devices
+
+    @staticmethod
+    def _select_device(device_id: str | None):
+        if not device_id:
+            return AudioUtilities.GetSpeakers()
+
+        for device in AudioUtilities.GetAllDevices():
+            candidate_id = str(getattr(device, "id", getattr(device, "FriendlyName", "")))
+            if candidate_id == device_id:
+                return device
+        return AudioUtilities.GetSpeakers()
 
     @property
     def device_name(self) -> str:
@@ -209,7 +257,7 @@ class WindowsAudio:
 
     @property
     def channel_count(self) -> int:
-        return int(self.volume.GetChannelCount())
+        return self._channel_count
 
     def read_channel_scalars(self) -> tuple[float, ...]:
         count = self.channel_count
@@ -289,20 +337,23 @@ class WindowsAudio:
 
 class LinuxAudio:
     backend_name = "Linux"
-    sink_name = "@DEFAULT_SINK@"
 
-    def __init__(self) -> None:
+    def __init__(self, device_id: str | None = None) -> None:
         if not IS_LINUX:
             raise RuntimeError("Linux audio controls are only available on Linux.")
         if not shutil.which("pactl"):
             raise RuntimeError("pactl was not found. Install PulseAudio utilities or PipeWire Pulse compatibility.")
-        self.default_sink = self._run_pactl("get-default-sink").strip()
-        if not self.default_sink:
+        self.sink_name = device_id or self._run_pactl("get-default-sink").strip()
+        if not self.sink_name:
             raise RuntimeError("Could not determine the default audio output sink.")
+        self._device_name = self._sink_display_name(self.sink_name)
         self._last_channels: tuple[float, ...] | None = None
+        self._channel_count = 1
         self.original_channels = self.read_channel_scalars()
+        self._channel_count = len(self.original_channels)
 
-    def _run_pactl(self, *args: str) -> str:
+    @staticmethod
+    def _run_pactl(*args: str) -> str:
         try:
             completed = subprocess.run(
                 ["pactl", *args],
@@ -320,48 +371,56 @@ class LinuxAudio:
             raise RuntimeError("pactl timed out.") from exc
         return completed.stdout
 
-    def _default_sink_info(self) -> dict:
-        output = self._run_pactl("--format=json", "list", "sinks")
+    @staticmethod
+    def _list_sink_dicts() -> list[dict]:
+        output = LinuxAudio._run_pactl("--format=json", "list", "sinks")
         try:
             sinks = json.loads(output)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Could not parse pactl sink information.") from exc
+        return sinks if isinstance(sinks, list) else []
 
-        for sink in sinks:
-            if sink.get("name") == self.default_sink:
-                return sink
-        raise RuntimeError(f"Default sink was not found: {self.default_sink}")
+    @staticmethod
+    def list_devices() -> list[AudioDevice]:
+        if not IS_LINUX or not shutil.which("pactl"):
+            return []
+        default_sink = LinuxAudio._run_pactl("get-default-sink").strip()
+        devices: list[AudioDevice] = []
+        for sink in LinuxAudio._list_sink_dicts():
+            sink_id = str(sink.get("name") or "")
+            if not sink_id:
+                continue
+            devices.append(
+                AudioDevice(
+                    id=sink_id,
+                    name=str(sink.get("description") or sink_id),
+                    is_default=sink_id == default_sink,
+                )
+            )
+        return devices
+
+    @staticmethod
+    def _sink_display_name(sink_name: str) -> str:
+        for sink in LinuxAudio._list_sink_dicts():
+            if sink.get("name") == sink_name:
+                return str(sink.get("description") or sink_name)
+        return sink_name
 
     @property
     def device_name(self) -> str:
-        info = self._default_sink_info()
-        return str(info.get("description") or info.get("name") or "Default playback device")
+        return self._device_name
 
     @property
     def channel_count(self) -> int:
-        return len(self.read_channel_scalars())
+        return self._channel_count
 
     def read_channel_scalars(self) -> tuple[float, ...]:
-        info = self._default_sink_info()
-        volumes = info.get("volume")
-        if not isinstance(volumes, dict) or not volumes:
-            raise RuntimeError("Default sink does not expose channel volume information.")
-
-        channels: list[float] = []
-        for channel in volumes.values():
-            if not isinstance(channel, dict):
-                continue
-            percent_text = str(channel.get("value_percent", "")).strip()
-            match = re.search(r"(-?\d+(?:\.\d+)?)%", percent_text)
-            if match:
-                channels.append(max(0.0, float(match.group(1)) / 100.0))
-                continue
-            value = channel.get("value")
-            if isinstance(value, (int, float)):
-                channels.append(max(0.0, float(value) / 65536.0))
+        output = self._run_pactl("get-sink-volume", self.sink_name)
+        channels = [max(0.0, float(value) / 100.0) for value in re.findall(r"/\s*(\d+(?:\.\d+)?)%\s*/", output)]
 
         if not channels:
-            raise RuntimeError("Could not read default sink channel volumes.")
+            raise RuntimeError("Could not read sink channel volumes.")
+        self._channel_count = len(channels)
         return tuple(channels)
 
     def restore_original(self) -> None:
@@ -420,11 +479,19 @@ class LinuxAudio:
         return base * 100.0, left * 100.0, right * 100.0
 
 
-def create_audio_backend() -> WindowsAudio | LinuxAudio:
+def list_audio_devices() -> list[AudioDevice]:
     if IS_WINDOWS:
-        return WindowsAudio()
+        return WindowsAudio.list_devices()
     if IS_LINUX:
-        return LinuxAudio()
+        return LinuxAudio.list_devices()
+    return []
+
+
+def create_audio_backend(device_id: str | None = None) -> WindowsAudio | LinuxAudio:
+    if IS_WINDOWS:
+        return WindowsAudio(device_id)
+    if IS_LINUX:
+        return LinuxAudio(device_id)
     raise RuntimeError(f"{sys.platform} is not supported yet.")
 
 
@@ -465,8 +532,8 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         icon = app_icon()
         if icon:
             self.setWindowIcon(icon)
-        self.resize(460, 560)
-        self.setMinimumSize(420, 500)
+        self.resize(500, 660)
+        self.setMinimumSize(460, 620)
 
         self.audio: WindowsAudio | LinuxAudio | None = None
         self.apo = find_apo_config()
@@ -474,13 +541,25 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.apo_snapshot: ApoSnapshot | None = None
         self.closing = False
         self.loading = False
+        self.apply_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hearing-boost-audio")
+        self.apply_future: Future | None = None
+        self.pending_apply: tuple[int, int, bool] | None = None
+        self.selected_device_id: str | None = None
+        self.quit_requested = False
+        self.tray_notice_shown = False
 
         self.apply_timer = QTimer(self)
         self.apply_timer.setSingleShot(True)
         self.apply_timer.timeout.connect(self.apply_settings)
+        self.apply_final = False
+
+        self.result_timer = QTimer(self)
+        self.result_timer.timeout.connect(self._poll_apply_result)
+        self.result_timer.start(60)
 
         self._apply_style()
         self._build()
+        self._build_tray()
         self._connect_audio()
         self._capture_apo_snapshot()
         self._schedule_apply()
@@ -529,6 +608,10 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
                 color: #ffffff;
                 font-size: 10pt;
             }}
+            QLabel#warning {{
+                color: #ffcf66;
+                font-size: 8.5pt;
+            }}
             QFrame#separator {{
                 color: #222222;
                 background: #222222;
@@ -548,6 +631,22 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             }}
             QPushButton:pressed {{
                 background: #242424;
+            }}
+            QComboBox {{
+                background: #050505;
+                color: #ffffff;
+                border: 1px solid #2d2d2d;
+                padding: 7px 10px;
+                min-height: 20px;
+            }}
+            QComboBox:hover {{
+                border-color: #686868;
+            }}
+            QComboBox QAbstractItemView {{
+                background: #050505;
+                color: #ffffff;
+                selection-background-color: #242424;
+                border: 1px solid #333333;
             }}
             QCheckBox {{
                 color: #ffffff;
@@ -609,7 +708,11 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.device_label.setObjectName("caption")
         self.device_label.setWordWrap(True)
         layout.addWidget(self.device_label)
-        layout.addSpacing(30)
+
+        self.device_combo = QComboBox()
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        layout.addWidget(self.device_combo)
+        layout.addSpacing(24)
 
         boost_header = QHBoxLayout()
         boost_header.setContentsMargins(0, 0, 0, 0)
@@ -626,10 +729,14 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.boost_slider.setRange(0, 500)
         self.boost_slider.setValue(100)
         self.boost_slider.valueChanged.connect(self._on_boost_changed)
+        self.boost_slider.sliderReleased.connect(self._on_slider_released)
         layout.addWidget(self.boost_slider)
 
         boost_marks = self._mark_row("0%", "500%")
         layout.addLayout(boost_marks)
+        self.boost_warning_label = QLabel("")
+        self.boost_warning_label.setObjectName("warning")
+        layout.addWidget(self.boost_warning_label)
         layout.addSpacing(26)
         layout.addWidget(make_separator())
         layout.addSpacing(26)
@@ -653,6 +760,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.balance_slider.setRange(-100, 100)
         self.balance_slider.setValue(0)
         self.balance_slider.valueChanged.connect(self._on_balance_changed)
+        self.balance_slider.sliderReleased.connect(self._on_slider_released)
         layout.addWidget(self.balance_slider)
 
         self.balance_value_label = QLabel("Center")
@@ -672,6 +780,23 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         controls.addStretch(1)
         controls.addWidget(self.reset_button)
         layout.addLayout(controls)
+        layout.addSpacing(12)
+
+        presets = QHBoxLayout()
+        presets.setContentsMargins(0, 0, 0, 0)
+        self.normal_preset_button = QPushButton("Normal")
+        self.normal_preset_button.clicked.connect(lambda: self.apply_preset(100, 0))
+        self.left_preset_button = QPushButton("Left ear")
+        self.left_preset_button.clicked.connect(lambda: self.apply_preset(130, -35))
+        self.right_preset_button = QPushButton("Right ear")
+        self.right_preset_button.clicked.connect(lambda: self.apply_preset(130, 35))
+        self.loud_preset_button = QPushButton("Loud")
+        self.loud_preset_button.clicked.connect(lambda: self.apply_preset(150, 0))
+        presets.addWidget(self.normal_preset_button)
+        presets.addWidget(self.left_preset_button)
+        presets.addWidget(self.right_preset_button)
+        presets.addWidget(self.loud_preset_button)
+        layout.addLayout(presets)
         layout.addSpacing(22)
 
         self.session_checkbox = QCheckBox("Restore original settings when closing")
@@ -711,6 +836,42 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             apo_controls.addStretch(1)
             layout.addLayout(apo_controls)
 
+    def _build_tray(self) -> None:
+        self.tray = None
+        if QSystemTrayIcon is None or not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        icon = app_icon()
+        if not icon:
+            return
+
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(f"{APP_NAME} {APP_VERSION}")
+        menu = QMenu(self)
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self.show)
+        hide_action = QAction("Hide", self)
+        hide_action.triggered.connect(self.hide)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_from_tray)
+        menu.addAction(show_action)
+        menu.addAction(hide_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def quit_from_tray(self) -> None:
+        self.quit_requested = True
+        self.close()
+
     def _mark_row(self, left: str, right: str) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 2, 0, 0)
@@ -725,7 +886,17 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
 
     def _connect_audio(self) -> None:
         try:
-            self.audio = create_audio_backend()
+            devices = list_audio_devices()
+            self.device_combo.blockSignals(True)
+            self.device_combo.clear()
+            for device in devices:
+                self.device_combo.addItem(device.name, device.id)
+                if device.is_default:
+                    self.device_combo.setCurrentIndex(self.device_combo.count() - 1)
+            self.device_combo.blockSignals(False)
+            if devices:
+                self.selected_device_id = self.device_combo.currentData()
+            self.audio = create_audio_backend(self.selected_device_id)
             current_volume, current_balance = self.audio.read_state()
             self.loading = True
             self.boost_slider.setValue(current_volume)
@@ -751,20 +922,53 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
     def _on_boost_changed(self) -> None:
         self._update_labels()
         if not self.loading:
-            self._schedule_apply()
+            self._schedule_apply(160)
 
     def _on_balance_changed(self) -> None:
         self._update_labels()
         if not self.loading:
-            self._schedule_apply()
+            self._schedule_apply(160)
 
-    def _schedule_apply(self, delay_ms: int = 140) -> None:
+    def _on_slider_released(self) -> None:
+        self._schedule_apply(0, final=True)
+
+    def _on_device_changed(self, _index=None) -> None:
+        if self.loading:
+            return
+        self.selected_device_id = self.device_combo.currentData()
+        if self.audio:
+            try:
+                self.audio.restore_original()
+            except Exception:
+                pass
+        try:
+            self.audio = create_audio_backend(self.selected_device_id)
+            current_volume, current_balance = self.audio.read_state()
+            self.loading = True
+            self.boost_slider.setValue(current_volume)
+            self.balance_slider.setValue(current_balance)
+            self.loading = False
+            self._update_labels()
+            self.device_label.setText(self.audio.device_name)
+            self.status_label.setText("Device changed.")
+            self._schedule_apply(0, final=True)
+        except Exception as exc:
+            self.status_label.setText(f"Could not switch device: {exc}")
+
+    def _schedule_apply(self, delay_ms: int = 140, final: bool = False) -> None:
+        self.apply_final = self.apply_final or final
         self.apply_timer.start(delay_ms)
 
     def _update_labels(self) -> None:
         boost = self.boost_slider.value()
         balance = self.balance_slider.value()
         self.boost_label.setText(f"{boost}%")
+        if boost >= 250:
+            self.boost_warning_label.setText("High boost can clip or distort audio.")
+        elif boost > 100:
+            self.boost_warning_label.setText("Software amplification active.")
+        else:
+            self.boost_warning_label.setText("")
         if balance == 0:
             self.balance_value_label.setText("Center")
         else:
@@ -775,33 +979,54 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             return
         boost = self.boost_slider.value()
         balance = self.balance_slider.value()
+        final_apply = self.apply_final
+        self.apply_final = False
         self.boost_label.setText(f"{boost}%")
 
         if not self.audio:
             return
 
-        self.status_label.setText("Applying...")
-        try:
-            windows, left, right, apo_active = self._apply_settings_blocking(boost, balance)
-        except Exception as exc:
-            self.status_label.setText(f"Failed to apply audio settings: {exc}")
+        command = (boost, balance, final_apply)
+        if self.apply_future and not self.apply_future.done():
+            self.pending_apply = command
             return
 
-        self.left_label.setText(f"L {left:.0f}%")
-        self.right_label.setText(f"R {right:.0f}%")
-        backend_name = self.audio.backend_name
-        if apo_active:
-            boost_note = f", APO +{db_for_boost(boost):.1f} dB"
-        elif IS_LINUX and boost > 100:
-            boost_note = ", software boost"
-        else:
-            boost_note = ""
-        if IS_WINDOWS and boost > 100 and not apo_active:
-            self.status_label.setText("Boost above 100% needs Equalizer APO. Applying 100% Windows volume instead.")
-        else:
-            self.status_label.setText(f"Applied {backend_name} {windows:.0f}%: L {left:.0f}% / R {right:.0f}%{boost_note}")
+        self.status_label.setText("Applying...")
+        self.apply_future = self.apply_executor.submit(self._apply_settings_blocking, boost, balance, final_apply)
 
-    def _apply_settings_blocking(self, boost: int, balance: int) -> tuple[float, float, float, bool]:
+    def _poll_apply_result(self) -> None:
+        if not self.apply_future or not self.apply_future.done():
+            return
+
+        try:
+            windows, left, right, apo_active = self.apply_future.result()
+        except Exception as exc:
+            self.status_label.setText(f"Failed to apply audio settings: {exc}")
+            self.apply_future = None
+        else:
+            self.apply_future = None
+            boost = self.boost_slider.value()
+            self.left_label.setText(f"L {left:.0f}%")
+            self.right_label.setText(f"R {right:.0f}%")
+            backend_name = self.audio.backend_name if self.audio else "Audio"
+            if apo_active:
+                boost_note = f", APO +{db_for_boost(boost):.1f} dB"
+            elif IS_LINUX and boost > 100:
+                boost_note = ", software boost"
+            else:
+                boost_note = ""
+            if IS_WINDOWS and boost > 100 and not apo_active:
+                self.status_label.setText("Boost above 100% needs Equalizer APO. Applying 100% Windows volume instead.")
+            else:
+                self.status_label.setText(f"Applied {backend_name} {windows:.0f}%: L {left:.0f}% / R {right:.0f}%{boost_note}")
+
+        if self.pending_apply:
+            boost, balance, final_apply = self.pending_apply
+            self.pending_apply = None
+            self.status_label.setText("Applying...")
+            self.apply_future = self.apply_executor.submit(self._apply_settings_blocking, boost, balance, final_apply)
+
+    def _apply_settings_blocking(self, boost: int, balance: int, final_apply: bool = False) -> tuple[float, float, float, bool]:
         if not self.audio:
             raise RuntimeError("Audio is not connected.")
 
@@ -809,19 +1034,19 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         if IS_WINDOWS and boost > 100:
             if self.apo.path and self.apo.writable:
                 try:
-                    if self.last_apo_boost != boost:
+                    if final_apply and self.last_apo_boost != boost:
                         update_apo_preamp(self.apo.path, boost)
                         self.last_apo_boost = boost
-                    apo_active = True
+                    apo_active = self.last_apo_boost == boost
                 except OSError as exc:
                     raise RuntimeError(f"Could not write Equalizer APO config: {exc}") from exc
             else:
                 pass
         elif IS_WINDOWS and self.apo.path and self.apo.writable:
             try:
-                if self.last_apo_boost != boost:
-                    update_apo_preamp(self.apo.path, boost)
-                    self.last_apo_boost = boost
+                if final_apply and self.last_apo_boost != 100:
+                    update_apo_preamp(self.apo.path, 100)
+                    self.last_apo_boost = 100
             except OSError:
                 pass
 
@@ -830,23 +1055,28 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
 
     def center_balance(self) -> None:
         self.balance_slider.setValue(0)
-        self._schedule_apply(0)
+        self._schedule_apply(0, final=True)
 
     def bump_balance(self, amount: int) -> None:
         self.balance_slider.setValue(max(-100, min(100, self.balance_slider.value() + amount)))
-        self._schedule_apply(0)
+        self._schedule_apply(0, final=True)
+
+    def apply_preset(self, boost: int, balance: int) -> None:
+        self.boost_slider.setValue(boost)
+        self.balance_slider.setValue(balance)
+        self._schedule_apply(0, final=True)
 
     def reset(self) -> None:
         self.boost_slider.setValue(100)
         self.balance_slider.setValue(0)
-        self._schedule_apply(0)
+        self._schedule_apply(0, final=True)
 
     def refresh_apo(self) -> None:
         self.apo = find_apo_config()
         self.apo_label.setText(self.apo.message)
         self.last_apo_boost = None
         self._capture_apo_snapshot()
-        self._schedule_apply(0)
+        self._schedule_apply(0, final=True)
 
     def install_apo(self) -> None:
         try:
@@ -876,6 +1106,11 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
 
         errors: list[str] = []
         self.apply_timer.stop()
+        if self.apply_future and not self.apply_future.done():
+            try:
+                self.apply_future.result(timeout=2)
+            except Exception as exc:
+                errors.append(f"Pending apply: {exc}")
 
         if self.apo_snapshot:
             try:
@@ -898,12 +1133,30 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             QMessageBox.warning(self, APP_NAME, "Some settings could not be restored:\n" + "\n".join(errors))
 
     def closeEvent(self, event) -> None:
+        if self.tray and not self.quit_requested:
+            self.hide()
+            if not self.tray_notice_shown:
+                self.tray.showMessage(APP_NAME, "Still running in the tray.", QSystemTrayIcon.MessageIcon.Information, 2500)
+                self.tray_notice_shown = True
+            event.ignore()
+            return
+
         self.closing = True
         self.restore_session()
+        self.apply_executor.shutdown(wait=False, cancel_futures=True)
+        if self.tray:
+            self.tray.hide()
         event.accept()
+        app = QApplication.instance()
+        if app:
+            QTimer.singleShot(0, app.quit)
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument("--minimized", action="store_true", help="Start hidden in the system tray.")
+    args = parser.parse_args()
+
     if QT_IMPORT_ERROR:
         print(
             f"{APP_NAME} needs PySide6 for its native UI. Install it with: python3 -m pip install -r requirements.txt\n"
@@ -912,13 +1165,17 @@ def main() -> int:
         )
         return 1
 
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
     icon = app_icon()
     if icon:
         app.setWindowIcon(icon)
     window = HearingBoostApp()
-    window.show()
+    if args.minimized and window.tray:
+        window.hide()
+    else:
+        window.show()
     return app.exec()
 
 

@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ -x ".venv/bin/python" ]; then
-    exec .venv/bin/python hearing_boost.py
+    exec .venv/bin/python hearing_boost.py "$@"
 fi
 
-exec python3 hearing_boost.py
+exec python3 hearing_boost.py "$@"

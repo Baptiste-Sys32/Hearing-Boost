@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Hearing Boost
+Comment=Temporary output boost and left/right balance utility
+Exec=__APP_DIR__/run_hearing_boost.sh
+Icon=__APP_DIR__/assets/hearing-boost-icon.svg
+Terminal=false
+Categories=Audio;Utility;
+StartupNotify=true
