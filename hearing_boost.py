@@ -543,6 +543,50 @@ def _clean_linux_app_name(name: str, binary: str = "", app_id: str = "") -> str:
     return "Audio stream"
 
 
+def _clean_windows_app_name(display_name: str = "", process_name: str = "") -> str:
+    raw = (display_name or process_name).strip()
+    if not raw:
+        return "Audio stream"
+    if raw.startswith("@%SystemRoot%") or raw.startswith("@{"):
+        return ""
+    if raw.lower().endswith(".exe"):
+        raw = raw[:-4]
+    known = {
+        "discord": "Discord",
+        "spotify": "Spotify",
+        "chrome": "Chrome",
+        "msedge": "Microsoft Edge",
+        "brave": "Brave",
+        "firefox": "Firefox",
+    }
+    return known.get(raw.lower(), raw[:1].upper() + raw[1:] if raw.islower() else raw)
+
+
+def _windows_session_identity(session) -> tuple[str, str, str] | None:
+    process = getattr(session, "Process", None)
+    display_name = str(getattr(session, "DisplayName", "") or "").strip()
+    try:
+        process_name = process.name() if process else ""
+    except Exception:
+        process_name = ""
+    process_name = str(process_name or "").strip()
+
+    if display_name.startswith("@%SystemRoot%") or display_name.startswith("@{"):
+        if not process_name or process_name.lower() in {"audiodg.exe", "svchost.exe"}:
+            return None
+
+    name = _clean_windows_app_name(display_name, process_name)
+    if not name:
+        return None
+
+    group_source = process_name or display_name or name
+    group_key = re.sub(r"[^a-z0-9]+", "-", group_source.lower()).strip("-")
+    if not group_key:
+        return None
+    process_id = str(getattr(process, "pid", "") or getattr(session, "ProcessId", "") or "")
+    return f"winapp:{group_key}", name, process_id
+
+
 def _linux_client_properties() -> dict[str, dict]:
     try:
         output = LinuxAudio._run_pactl("--format=json", "list", "clients")
@@ -582,36 +626,51 @@ def list_windows_app_volume_sessions() -> list[AppVolumeSession]:
         return []
 
     comtypes.CoInitialize()
-    sessions: list[AppVolumeSession] = []
-    seen: set[str] = set()
+    grouped: dict[str, dict] = {}
     for session in AudioUtilities.GetAllSessions():
         volume = getattr(session, "SimpleAudioVolume", None)
         if volume is None:
             continue
 
-        process = getattr(session, "Process", None)
-        process_id = str(getattr(process, "pid", "") or getattr(session, "ProcessId", "") or "")
-        display_name = str(getattr(session, "DisplayName", "") or "").strip()
-        try:
-            process_name = process.name() if process else ""
-        except Exception:
-            process_name = ""
-        name = display_name or process_name or f"Audio session {process_id or len(sessions) + 1}"
-        session_id = process_id or name
-        if session_id in seen:
+        identity = _windows_session_identity(session)
+        if identity is None:
             continue
-        seen.add(session_id)
+        session_id, name, process_id = identity
         try:
             current = round(max(0.0, min(1.0, float(volume.GetMasterVolume()))) * 100.0)
         except Exception:
             continue
+
+        group = grouped.setdefault(
+            session_id,
+            {
+                "name": name,
+                "volumes": [],
+                "process_ids": set(),
+                "count": 0,
+            },
+        )
+        group["volumes"].append(current)
+        if process_id:
+            group["process_ids"].add(process_id)
+        group["count"] += 1
+
+    sessions: list[AppVolumeSession] = []
+    for session_id, group in grouped.items():
+        count = int(group["count"])
+        process_count = len(group["process_ids"])
+        detail_parts = []
+        if count > 1:
+            detail_parts.append(f"{count} audio streams")
+        if process_count > 1:
+            detail_parts.append(f"{process_count} processes")
         sessions.append(
             AppVolumeSession(
                 id=session_id,
-                name=name,
-                volume_percent=current,
+                name=str(group["name"]),
+                volume_percent=round(max(group["volumes"])),
                 max_percent=500,
-                detail="",
+                detail=", ".join(detail_parts),
             )
         )
     return sorted(sessions, key=lambda item: item.name.lower())
@@ -625,14 +684,10 @@ def set_windows_app_volume_session(session_id: str, volume_percent: float) -> No
     target = max(0.0, min(1.0, float(volume_percent) / 100.0))
     matched = False
     for session in AudioUtilities.GetAllSessions():
-        process = getattr(session, "Process", None)
-        process_id = str(getattr(process, "pid", "") or getattr(session, "ProcessId", "") or "")
-        display_name = str(getattr(session, "DisplayName", "") or "").strip()
-        try:
-            process_name = process.name() if process else ""
-        except Exception:
-            process_name = ""
-        candidate_id = process_id or display_name or process_name
+        identity = _windows_session_identity(session)
+        if identity is None:
+            continue
+        candidate_id, _name, _process_id = identity
         if candidate_id == session_id and getattr(session, "SimpleAudioVolume", None):
             session.SimpleAudioVolume.SetMasterVolume(target, None)
             matched = True
@@ -1124,7 +1179,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.app_scroll.setWidget(self.app_scroll_content)
         layout.addWidget(self.app_scroll, 1)
 
-        self.app_status_label = QLabel("Select Refresh to scan active audio streams.")
+        self.app_status_label = QLabel("Select Refresh to scan active apps with audio.")
         self.app_status_label.setObjectName("status")
         self.app_status_label.setWordWrap(True)
         layout.addSpacing(12)
@@ -1163,7 +1218,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             return
 
         if not sessions:
-            empty = QLabel("No active app audio streams found.")
+            empty = QLabel("No active apps with audio found.")
             empty.setObjectName("caption")
             self.app_rows.addWidget(empty)
             self.app_rows.addStretch(1)
@@ -1176,7 +1231,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
                 self.app_desired_volumes[session.id] = session.volume_percent
             self._add_app_session_row(session)
         self.app_rows.addStretch(1)
-        self.app_status_label.setText(f"Found {len(sessions)} active audio stream{'s' if len(sessions) != 1 else ''}.")
+        self.app_status_label.setText(f"Found {len(sessions)} active app{'s' if len(sessions) != 1 else ''} with audio.")
         self.app_volume_loading = False
 
     def _add_app_session_row(self, session: AppVolumeSession) -> None:
