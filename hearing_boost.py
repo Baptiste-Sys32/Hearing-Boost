@@ -62,11 +62,14 @@ QT_MAIN_WINDOW_BASE = QMainWindow if QMainWindow is not None else object
 
 try:
     import comtypes
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from pycaw.pycaw import AudioSession, AudioUtilities, IAudioEndpointVolume, IAudioSessionControl2, IAudioSessionManager2
 except Exception as exc:  # pragma: no cover - shown in GUI at runtime
     comtypes = None
+    AudioSession = None
     AudioUtilities = None
     IAudioEndpointVolume = None
+    IAudioSessionControl2 = None
+    IAudioSessionManager2 = None
     IMPORT_ERROR = exc
 else:
     IMPORT_ERROR = None
@@ -603,17 +606,17 @@ def _linux_client_properties() -> dict[str, dict]:
     return properties_by_client
 
 
-def list_app_volume_sessions() -> list[AppVolumeSession]:
+def list_app_volume_sessions(device_id: str | None = None) -> list[AppVolumeSession]:
     if IS_WINDOWS:
-        return list_windows_app_volume_sessions()
+        return list_windows_app_volume_sessions(device_id)
     if IS_LINUX:
         return list_linux_app_volume_sessions()
     return []
 
 
-def set_app_volume_session(session_id: str, volume_percent: int) -> None:
+def set_app_volume_session(session_id: str, volume_percent: int, device_id: str | None = None) -> None:
     if IS_WINDOWS:
-        set_windows_app_volume_session(session_id, volume_percent)
+        set_windows_app_volume_session(session_id, volume_percent, device_id)
         return
     if IS_LINUX:
         set_linux_app_volume_session(session_id, volume_percent)
@@ -621,13 +624,36 @@ def set_app_volume_session(session_id: str, volume_percent: int) -> None:
     raise RuntimeError(f"{sys.platform} is not supported yet.")
 
 
-def list_windows_app_volume_sessions() -> list[AppVolumeSession]:
-    if not IS_WINDOWS or IMPORT_ERROR:
+def _windows_sessions_for_device(device_id: str | None = None):
+    if not IS_WINDOWS or IMPORT_ERROR or AudioSession is None:
         return []
 
     comtypes.CoInitialize()
+    try:
+        device = WindowsAudio._select_device(device_id)
+        raw_device = getattr(device, "_dev", device)
+        manager_unknown = raw_device.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None)
+        manager = manager_unknown.QueryInterface(IAudioSessionManager2)
+        session_enumerator = manager.GetSessionEnumerator()
+        sessions = []
+        for index in range(session_enumerator.GetCount()):
+            control = session_enumerator.GetSession(index)
+            if control is None:
+                continue
+            control2 = control.QueryInterface(IAudioSessionControl2)
+            if control2 is not None:
+                sessions.append(AudioSession(control2))
+        return sessions
+    except Exception:
+        return AudioUtilities.GetAllSessions()
+
+
+def list_windows_app_volume_sessions(device_id: str | None = None) -> list[AppVolumeSession]:
+    if not IS_WINDOWS or IMPORT_ERROR:
+        return []
+
     grouped: dict[str, dict] = {}
-    for session in AudioUtilities.GetAllSessions():
+    for session in _windows_sessions_for_device(device_id):
         volume = getattr(session, "SimpleAudioVolume", None)
         if volume is None:
             continue
@@ -676,14 +702,14 @@ def list_windows_app_volume_sessions() -> list[AppVolumeSession]:
     return sorted(sessions, key=lambda item: item.name.lower())
 
 
-def set_windows_app_volume_session(session_id: str, volume_percent: float) -> None:
+def set_windows_app_volume_session(session_id: str, volume_percent: float, device_id: str | None = None) -> None:
     if not IS_WINDOWS or IMPORT_ERROR:
         raise RuntimeError("Windows app audio controls are not available.")
 
     comtypes.CoInitialize()
     target = max(0.0, min(1.0, float(volume_percent) / 100.0))
     matched = False
-    for session in AudioUtilities.GetAllSessions():
+    for session in _windows_sessions_for_device(device_id):
         identity = _windows_session_identity(session)
         if identity is None:
             continue
@@ -826,11 +852,16 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.result_timer.timeout.connect(self._poll_apply_result)
         self.result_timer.start(60)
 
+        self.apo_monitor_timer = QTimer(self)
+        self.apo_monitor_timer.timeout.connect(self._auto_refresh_apo)
+
         self._apply_style()
         self._build()
         self._build_tray()
         self._connect_audio()
         self._capture_apo_snapshot()
+        if IS_WINDOWS:
+            self.apo_monitor_timer.start(5000)
         self._schedule_apply()
 
     def _apply_style(self) -> None:
@@ -1032,6 +1063,16 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.tabs.addTab(app_tab, "App Management")
         self._build_app_tab(self.app_layout)
 
+        if IS_WINDOWS:
+            settings_tab = QWidget()
+            self.settings_layout = QVBoxLayout(settings_tab)
+            self.settings_layout.setContentsMargins(0, 0, 0, 0)
+            self.settings_layout.setSpacing(0)
+            self.settings_tab_index = self.tabs.addTab(settings_tab, "Settings")
+            self._build_settings_tab(self.settings_layout)
+            if not self.apo.writable:
+                self.tabs.setCurrentIndex(self.settings_tab_index)
+
     def _build_main_tab(self, layout: QVBoxLayout) -> None:
         boost_header = QHBoxLayout()
         boost_header.setContentsMargins(0, 0, 0, 0)
@@ -1130,10 +1171,11 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        self.apo_label = QLabel(self.apo.message)
-        self.apo_label.setObjectName("footer")
-        self.apo_label.setWordWrap(True)
-        layout.addWidget(self.apo_label)
+        if not IS_WINDOWS:
+            self.apo_label = QLabel(self.apo.message)
+            self.apo_label.setObjectName("footer")
+            self.apo_label.setWordWrap(True)
+            layout.addWidget(self.apo_label)
         layout.addStretch(1)
 
         self.credits_label = QLabel(f'v{APP_VERSION}  |  by <a href="{GITHUB_URL}">CatGPT-Sys32</a>')
@@ -1142,18 +1184,6 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.credits_label.setTextFormat(Qt.TextFormat.RichText)
         self.credits_label.linkActivated.connect(open_external_url)
         layout.addWidget(self.credits_label)
-
-        if IS_WINDOWS:
-            layout.addSpacing(14)
-            apo_controls = QHBoxLayout()
-            self.install_button = QPushButton("Install APO")
-            self.install_button.clicked.connect(self.install_apo)
-            self.refresh_button = QPushButton("Refresh")
-            self.refresh_button.clicked.connect(self.refresh_apo)
-            apo_controls.addWidget(self.install_button)
-            apo_controls.addWidget(self.refresh_button)
-            apo_controls.addStretch(1)
-            layout.addLayout(apo_controls)
 
     def _build_app_tab(self, layout: QVBoxLayout) -> None:
         header = QHBoxLayout()
@@ -1185,10 +1215,35 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         layout.addSpacing(12)
         layout.addWidget(self.app_status_label)
 
+    def _build_settings_tab(self, layout: QVBoxLayout) -> None:
+        title = QLabel("Equalizer APO")
+        title.setObjectName("section")
+        layout.addWidget(title)
+        layout.addSpacing(10)
+
+        self.apo_label = QLabel(self.apo.message)
+        self.apo_label.setObjectName("status")
+        self.apo_label.setWordWrap(True)
+        layout.addWidget(self.apo_label)
+        layout.addSpacing(18)
+
+        apo_controls = QHBoxLayout()
+        apo_controls.setContentsMargins(0, 0, 0, 0)
+        self.install_button = QPushButton("Install APO")
+        self.install_button.clicked.connect(self.install_apo)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_apo)
+        apo_controls.addWidget(self.install_button)
+        apo_controls.addWidget(self.refresh_button)
+        apo_controls.addStretch(1)
+        layout.addLayout(apo_controls)
+        layout.addStretch(1)
+
     def _on_tab_changed(self, index: int) -> None:
         if self.tabs.tabText(index) != "App Management":
             return
-        self._neutralize_global_boost()
+        if not IS_WINDOWS:
+            self._neutralize_global_boost()
         self.refresh_app_sessions()
 
     def _neutralize_global_boost(self) -> None:
@@ -1207,11 +1262,12 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.app_volume_labels.clear()
 
     def refresh_app_sessions(self) -> None:
-        self._neutralize_global_boost()
+        if not IS_WINDOWS:
+            self._neutralize_global_boost()
         self._clear_app_rows()
         self.app_volume_loading = True
         try:
-            sessions = list_app_volume_sessions()
+            sessions = list_app_volume_sessions(self.selected_device_id if IS_WINDOWS else None)
         except Exception as exc:
             self.app_status_label.setText(f"Could not read app audio sessions: {exc}")
             self.app_volume_loading = False
@@ -1290,7 +1346,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
                 self._apply_windows_effective_app_volumes()
             else:
                 self._neutralize_global_boost()
-                set_app_volume_session(session_id, slider.value())
+                set_app_volume_session(session_id, slider.value(), self.selected_device_id)
         except Exception as exc:
             self.app_status_label.setText(f"Could not set app volume: {exc}")
             return
@@ -1315,20 +1371,39 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             self.apply_future.result(timeout=2)
             self.apply_future = None
 
-        if self.boost_slider.value() != 100:
-            self.boost_slider.blockSignals(True)
-            self.boost_slider.setValue(100)
-            self.boost_slider.blockSignals(False)
-            self._update_labels()
-
-        self._apply_settings_blocking(backing_boost, self.balance_slider.value(), True)
+        self._set_windows_apo_boost(backing_boost)
         for session_id, effective_volume in desired.items():
             mixer_volume = 0.0 if backing_boost <= 0 else (effective_volume / backing_boost) * 100.0
-            set_windows_app_volume_session(session_id, mixer_volume)
+            set_windows_app_volume_session(session_id, mixer_volume, self.selected_device_id)
 
-        self.left_label.setText("L 100%")
-        self.right_label.setText("R 100%")
+        if self.audio:
+            current_volume, current_balance = self.audio.read_state()
+            self.boost_slider.blockSignals(True)
+            self.balance_slider.blockSignals(True)
+            self.boost_slider.setValue(current_volume)
+            self.balance_slider.setValue(current_balance)
+            self.boost_slider.blockSignals(False)
+            self.balance_slider.blockSignals(False)
+            self._update_labels()
+            self.left_label.setText(f"L {current_volume}%")
+            self.right_label.setText(f"R {current_volume}%")
         self.status_label.setText(f"App Management backing boost: {backing_boost}%.")
+
+    def _set_windows_apo_boost(self, boost: int) -> None:
+        if not IS_WINDOWS:
+            return
+        target_boost = max(100, min(500, boost))
+        if target_boost > 100:
+            if not (self.apo.path and self.apo.writable):
+                raise RuntimeError("Effective app volume above 100% needs Equalizer APO. Install or refresh APO first.")
+        elif not (self.apo.path and self.apo.writable):
+            self.last_apo_boost = None
+            return
+
+        if self.last_apo_boost == target_boost:
+            return
+        update_apo_preamp(self.apo.path, target_boost)
+        self.last_apo_boost = target_boost
 
     def _build_tray(self) -> None:
         self.tray = None
@@ -1412,6 +1487,38 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
                 )
             except OSError:
                 self.apo_snapshot = None
+        else:
+            self.apo_snapshot = None
+
+    def _sync_apo_ui(self) -> None:
+        apo_label = getattr(self, "apo_label", None)
+        if apo_label:
+            apo_label.setText(self.apo.message)
+
+    def _auto_refresh_apo(self) -> None:
+        if not IS_WINDOWS or self.closing:
+            return
+
+        previous = (
+            str(self.apo.path) if self.apo.path else "",
+            self.apo.writable,
+            self.apo.message,
+        )
+        current = find_apo_config()
+        next_state = (
+            str(current.path) if current.path else "",
+            current.writable,
+            current.message,
+        )
+        if next_state == previous:
+            return
+
+        self.apo = current
+        self.last_apo_boost = None
+        self._capture_apo_snapshot()
+        self._sync_apo_ui()
+        if self.apo.writable:
+            self.status_label.setText("Equalizer APO detected.")
 
     def _on_boost_changed(self) -> None:
         self._update_labels()
@@ -1567,7 +1674,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
 
     def refresh_apo(self) -> None:
         self.apo = find_apo_config()
-        self.apo_label.setText(self.apo.message)
+        self._sync_apo_ui()
         self.last_apo_boost = None
         self._capture_apo_snapshot()
         self._schedule_apply(0, final=True)

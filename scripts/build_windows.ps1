@@ -19,5 +19,6 @@ python -m PyInstaller `
     --name HearingBoost `
     @IconArgs `
     --add-data "assets\hearing-boost-icon.svg;assets" `
+    --add-data "assets\checkbox-check.svg;assets" `
     --version-file "packaging\windows_version_info.txt" `
     hearing_boost.py
