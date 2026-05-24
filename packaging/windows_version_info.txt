@@ -15,7 +15,7 @@ VSVersionInfo(
       StringTable(
         "040904B0",
         [
-          StringStruct("CompanyName", "CatGPT-Sys32"),
+          StringStruct("CompanyName", "Baptiste-Sys32"),
           StringStruct("FileDescription", "Hearing Boost"),
           StringStruct("FileVersion", "1.1.0"),
           StringStruct("InternalName", "HearingBoost"),

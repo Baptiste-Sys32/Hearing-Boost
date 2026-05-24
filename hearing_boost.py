@@ -77,7 +77,7 @@ else:
 
 APP_NAME = "Hearing Boost"
 APP_VERSION = "1.1.0"
-GITHUB_URL = "https://github.com/CatGPT-Sys32"
+GITHUB_URL = "https://github.com/Baptiste-Sys32"
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "hearing-boost-icon.svg"
 CHECKMARK_ICON_PATH = Path(__file__).resolve().parent / "assets" / "checkbox-check.svg"
 APO_DOWNLOAD_URL = "https://sourceforge.net/projects/equalizerapo/files/1.4.2/EqualizerAPO-x64-1.4.2.exe/download"
@@ -1178,7 +1178,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             layout.addWidget(self.apo_label)
         layout.addStretch(1)
 
-        self.credits_label = QLabel(f'v{APP_VERSION}  |  by <a href="{GITHUB_URL}">CatGPT-Sys32</a>')
+        self.credits_label = QLabel(f'v{APP_VERSION}  |  by <a href="{GITHUB_URL}">Baptiste-Sys32</a>')
         self.credits_label.setObjectName("credits")
         self.credits_label.setOpenExternalLinks(False)
         self.credits_label.setTextFormat(Qt.TextFormat.RichText)
