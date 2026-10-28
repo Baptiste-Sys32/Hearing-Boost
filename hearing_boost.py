@@ -366,6 +366,7 @@ class LinuxAudio:
         self._device_name = self._sink_display_name(self.sink_name)
         self._last_channels: tuple[float, ...] | None = None
         self._channel_count = 1
+        self.capped_percent: float | None = None
         self.original_channels = self.read_channel_scalars()
         self._channel_count = len(self.original_channels)
 
@@ -493,7 +494,38 @@ class LinuxAudio:
             raise
 
         self._last_channels = channels
-        return base * 100.0, left * 100.0, right * 100.0
+        return self._verified_volumes(channels)
+
+    @staticmethod
+    def _as_triplet(values: tuple[float, ...]) -> tuple[float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0
+        peak = max(values)
+        left = values[0]
+        right = values[1] if len(values) > 1 else values[0]
+        return peak, left, right
+
+    def _verified_volumes(self, channels: tuple[float, ...]) -> tuple[float, float, float]:
+        """Read back what the server really applied.
+
+        Some audio servers silently clamp sink volume (often at 100%).
+        Returning the requested values as fact is what made over-100%
+        boost look applied when it was capped, so report actuals and
+        record the cap when one is hit. Never raises: on read failure
+        it falls back to the requested values.
+        """
+        requested = tuple(channel * 100.0 for channel in channels)
+        self.capped_percent = None
+        try:
+            actual = self.read_channel_scalars()
+        except Exception:
+            return self._as_triplet(requested)
+        if not actual:
+            return self._as_triplet(requested)
+        actual_pct = tuple(value * 100.0 for value in actual)
+        if max(requested) - max(actual_pct) > 3.0:
+            self.capped_percent = round(max(actual_pct))
+        return self._as_triplet(actual_pct)
 
 
 def list_audio_devices() -> list[AudioDevice]:
@@ -1567,7 +1599,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         if boost >= 250:
             self.boost_warning_label.setText("High boost can clip or distort audio.")
         elif boost > 100:
-            self.boost_warning_label.setText("Software amplification active.")
+            self.boost_warning_label.setText("Above 100% applies only if your audio server allows it.")
         else:
             self.boost_warning_label.setText("")
         if balance == 0:
@@ -1613,7 +1645,11 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             if apo_active:
                 boost_note = f", APO +{db_for_boost(boost):.1f} dB"
             elif IS_LINUX and boost > 100:
-                boost_note = ", software boost"
+                capped = getattr(self.audio, "capped_percent", None)
+                if capped is not None:
+                    boost_note = f", system caps output at {capped}%"
+                else:
+                    boost_note = ", software boost"
             else:
                 boost_note = ""
             if IS_WINDOWS and boost > 100 and not apo_active:
